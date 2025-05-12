@@ -1,67 +1,112 @@
-import streamlit as st
-from qdrant_client import QdrantClient
-from qdrant_client.http import models
+import chainlit as cl
+from langgraph.graph import StateGraph, END
+from llm_wrapper import llm_call
+from qdrant_utils import query_qdrant
+import json
 
-# ✅ 1. Cache the client — only initialized once per session
-@st.cache_resource
-def get_qdrant_client():
-    return QdrantClient(":memory:")
+# State Object
+class AgentState:
+    def __init__(self):
+        self.memory = []
+        self.last_response = ""
 
-client = get_qdrant_client()
+# Node: Input
+def input_node(state: AgentState, message: str) -> AgentState:
+    state.memory.append({"user": message})
+    return state
 
-# ✅ 2. Function to upload only once per session
-def upload_points_once(documents, encoder, collection_name="my_collection"):
-    if not documents:
-        st.error("❌ No documents provided. Please provide valid documents to upload.")
-        return
+# Node: LLM Entity Extraction
+def extraction_node(state: AgentState) -> AgentState:
+    user_message = state.memory[-1]["user"]
+    extraction_prompt = f"""
+Extract the following information from the user's query:
 
-    if "points_uploaded" not in st.session_state:
-        print("Initializing session state for points_uploaded.")
-        st.session_state.points_uploaded = False
+1. Application Name as stored in the database (Example: SALES_APP).
+2. Start Date in ISO format (YYYY-MM-DD).
+3. End Date in ISO format (YYYY-MM-DD).
 
-    if not st.session_state.points_uploaded:
-        try:
-            points = []
-            for idx, doc in enumerate(documents):
-                if "text" not in doc or not doc["text"]:
-                    st.warning(f"⚠️ Skipping document {idx} due to missing or empty 'text'.")
-                    continue
+Rules:
+- If only a single date is mentioned, start_date and end_date should both be that date.
+- If a date range is provided, extract both start and end dates.
+- If no date is mentioned, return null for both dates.
+- Application names should be returned in UPPERCASE.
 
-                vector = encoder.encode(doc["text"])
-                points.append(models.PointStruct(id=idx, vector=vector, payload=doc))
+Respond strictly in this JSON format:
+{{"app_name": "<APP_NAME>", "start_date": "<YYYY-MM-DD>", "end_date": "<YYYY-MM-DD>"}}
 
-            if not points:
-                st.error("❌ No valid documents to upload after preprocessing.")
-                return
+User Query: "{user_message}"
+"""
+    extraction_response = llm_call(extraction_prompt)
+    try:
+        extracted_data = json.loads(extraction_response)
+    except json.JSONDecodeError:
+        extracted_data = {"app_name": None, "start_date": None, "end_date": None}
 
-            vector_size = len(points[0].vector)  # Explicitly set vector size
+    state.memory.append({"extracted_info": extracted_data})
+    return state
 
-            client.recreate_collection(
-                collection_name=collection_name,
-                vectors_config=models.VectorParams(
-                    size=vector_size,
-                    distance=models.Distance.COSINE
-                )
-            )
+# Node: Qdrant Query
+def qdrant_node(state: AgentState) -> AgentState:
+    extracted_info = state.memory[-1]["extracted_info"]
+    app_name = extracted_info.get("app_name")
+    start_date = extracted_info.get("start_date")
+    end_date = extracted_info.get("end_date")
 
-            client.upload_points(collection_name=collection_name, points=points)
-            st.session_state.points_uploaded = True
-            st.success("✅ Points uploaded to in-memory Qdrant.")
-        except Exception as e:
-            st.error(f"❌ Failed to upload points: {e}")
+    if not app_name:
+        result = "No valid application name found in the query."
     else:
-        print("Points already uploaded in this session.")
-        st.info("ℹ️ Points already uploaded in this session.")
+        result = query_qdrant(app_name, start_date, end_date)
 
-# ✅ 3. Example usage
-documents = [{"text": "Streamlit is awesome!"}, {"text": "Qdrant rocks!"}]
+    state.memory.append({"qdrant_result": result})
+    return state
 
-# Dummy encoder just for testing
-@st.cache_resource
-class DummyEncoder:
-    def encode(self, text):
-        return [float(len(text))] * 5  # 5-dim vector based on text length
+# Node: Final LLM Response
+def llm_response_node(state: AgentState) -> AgentState:
+    user_message = state.memory[-1]["user"]
+    extracted_info = state.memory[-1]["extracted_info"]
+    qdrant_data = state.memory[-1].get("qdrant_result", "")
 
-encoder = DummyEncoder()
+    prompt = f"""
+You are a customer support analysis assistant.
 
-upload_points_once(documents, encoder)
+User Query: {user_message}
+Extracted Information: {json.dumps(extracted_info)}
+Relevant Data from Database: {qdrant_data}
+
+Generate a concise and informative response for the user.
+"""
+    response = llm_call(prompt)
+    state.last_response = response
+    state.memory.append({"assistant": response})
+    return state
+
+# LangGraph Workflow
+graph = StateGraph(AgentState)
+graph.add_node("Input", input_node)
+graph.add_node("Extraction", extraction_node)
+graph.add_node("QueryQdrant", qdrant_node)
+graph.add_node("LLMResponse", llm_response_node)
+
+graph.set_entry_point("Input")
+graph.add_edge("Input", "Extraction")
+graph.add_edge("Extraction", "QueryQdrant")
+graph.add_edge("QueryQdrant", "LLMResponse")
+graph.add_edge("LLMResponse", END)
+
+app_graph = graph.compile()
+
+# Chainlit Integration
+@cl.on_chat_start
+def start():
+    cl.user_session.set("agent_state", AgentState())
+
+@cl.on_message
+async def main(message: cl.Message):
+    state: AgentState = cl.user_session.get("agent_state")
+    result = app_graph.invoke(state, {"message": message.content})
+    final_response = result.last_response
+
+    await cl.Message(content=final_response).send()
+
+"""
+"""
